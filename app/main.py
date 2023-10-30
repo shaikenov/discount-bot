@@ -1,87 +1,93 @@
 import asyncio
-import math
+import logging
+import sys
 import sqlite3
-import time
-from string import Template
+from os import getenv
 
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types.message import ContentType
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types.message import ContentType
+from aiogram.utils.markdown import hbold
+from constants import LINK_REPLY
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 import aiohttp
 
-from bot import send_message
+# Bot token can be obtained via https://t.me/BotFather
+TOKEN = getenv("BOT_TOKEN")
 
-BASE_URL = Template(
-    "https://api.technodom.kz/katalog/api/v1/products/category/noutbuki?city_id=5f5f1e3b4c8a49e692fefd70&limit=${limit}&page=${page}"
-)
-SOURCE = "TECHNODOM"
+# All handlers should be attached to the Router (or Dispatcher)
+bot = Bot(TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot=bot, storage=storage)
+
+class Form(StatesGroup):
+    link = State()
+
+TEMPLATE_API = "https://api.technodom.kz/katalog/api/v1/products/"
+CHAT_ID = None
 
 connection = sqlite3.connect("db.sql")
 db_cursor = connection.cursor()
 
+@dp.message_handler(commands="start")
+async def handle_start_command(message: Message) -> None:
+    global CHAT_ID
+    CHAT_ID = message.chat.id
+    await message.answer(f"Hello, {hbold(message.from_user.full_name)}!")
 
-async def get_laptops(limit: int = 10, page: int = 1):
-    url = BASE_URL.substitute(limit=limit, page=page)
+@dp.message_handler(commands="link")
+async def handle_link_command(message: Message) -> None:
+    await Form.link.set()
+    await message.answer(LINK_REPLY)
+
+@dp.message_handler(state=Form.link, content_types=ContentType.TEXT)
+async def handle_link(message: types.Message, state: FSMContext):
+    await Form.next()
+    parts = message.text.split("?")
+    suburl = parts[0]
+    subparts = suburl.split("-")
+    sku = subparts[-1]
+    url = TEMPLATE_API + sku
+    print(url)
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             response_json = await response.json()
-            data = response_json.get("payload")
-            for object in data:
-                external_id = object.get("sku")
-                price = int(object.get("price"))
-                source = SOURCE
-                uri = object.get("uri")
-                title = object.get("title")
-                row = db_cursor.execute(
-                    "SELECT id FROM items WHERE external_id=? AND source=?",
-                    (external_id, source),
-                ).fetchone()
-                if not row:
-                    db_cursor.execute(
-                        "INSERT INTO items (external_id, uri, source, title) VALUES (?, ?, ?, ?)",
-                        (external_id, uri, source, title),
-                    )
-                    connection.commit()
-                    row = db_cursor.execute(
-                        "SELECT id FROM items WHERE external_id=? AND source=?",
-                        (external_id, source),
-                    ).fetchone()
-                (item_id,) = row
-                item_last_price_row = db_cursor.execute(
-                    "SELECT price FROM prices WHERE item_id=? ORDER BY created_at DESC",
-                    (int(item_id),),
-                ).fetchone()
-                print("item_last_price_row", item_last_price_row)
-                if not item_last_price_row or int(item_last_price_row[0]) != int(price):
-                    db_cursor.execute(
-                        "INSERT INTO prices (item_id, price) VALUES (?, ?)",
-                        (int(item_id), price),
-                    )
-                    connection.commit()
-                    await session.close()
-                    return f"https://www.technodom.kz/p/{uri} {price} {item_last_price_row}"
+            link_id = response_json.get("sku")
+            print(link_id)
+            price = int(response_json.get("price"))
+            print(price)
+            title = response_json.get("title")
+            source = "TECHNODOM"
+            db_cursor.execute(
+                    "INSERT INTO cart (chat_id, link_id, source, title, price) VALUES (?, ?, ?, ?, ?)",
+                    (CHAT_ID, link_id, source, title, price),
+                )
+            first_price = db_cursor.execute(
+                "SELECT price FROM cart WHERE chat_id=? AND link_id=? ORDER BY created_at ASC",
+                (CHAT_ID, link_id),
+            ).fetchone()
+            print(first_price[0], price)
+            connection.commit()
+            await session.close()
+            await message.answer(f"h{message.text} {first_price} {price}")
+            return f"{message.text} {first_price} {price}"   
+    db_cursor.close()
+    connection.close()
     return ""
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        response = await session.get(BASE_URL.substitute(limit=10, page=1))
-        response_json = await response.json()
-        limit = response_json["limit"]
-        total = response_json["total"]
-        number_of_pages = math.ceil(total / limit)
-        tasks = []
-        for page in range(1, number_of_pages + 1):
-            task = asyncio.create_task(get_laptops(limit=limit, page=page))
-            tasks.append(task)
-        results = await asyncio.gather(*tasks)
-        results = [item for item in results if item]
-        max_items = 3
-        if results:
-            for i in range(0, len(results), max_items):
-                try:
-                    await send_message("\n".join(results[i : i + max_items]))
-                except:
-                    pass
-                time.sleep(10)
+
+async def main() -> None:
+    # Initialize Bot instance with a default parse mode which will be passed to all API calls
+    bot = Bot(TOKEN)
+    # And the run events dispatching
+    await dp.start_polling(bot)
 
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main())
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    asyncio.run(main())
