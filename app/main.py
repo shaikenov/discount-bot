@@ -9,7 +9,7 @@ import aiohttp
 from bot import send_message
 
 BASE_URL = Template(
-    "https://api.technodom.kz/katalog/api/v1/products/category/noutbuki?city_id=5f5f1e3b4c8a49e692fefd70&limit=${limit}&page=${page}"
+    "https://api.technodom.kz/katalog/api/v1/products/category/${category}?city_id=5f5f1e3b4c8a49e692fefd70&limit=${limit}&page=${page}"
 )
 SOURCE = "TECHNODOM"
 
@@ -17,8 +17,9 @@ connection = sqlite3.connect("db.sql")
 db_cursor = connection.cursor()
 
 
-async def get_laptops(limit: int = 10, page: int = 1):
-    url = BASE_URL.substitute(limit=limit, page=page)
+async def get_by_type(category: str, limit: int = 1, page: int = 1):
+    url = BASE_URL.substitute(category=category, limit=limit, page=page)
+    results = []
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             response_json = await response.json()
@@ -48,7 +49,6 @@ async def get_laptops(limit: int = 10, page: int = 1):
                     "SELECT price FROM prices WHERE item_id=? ORDER BY created_at DESC",
                     (int(item_id),),
                 ).fetchone()
-                print("item_last_price_row", item_last_price_row)
                 if not item_last_price_row or int(item_last_price_row[0]) != int(price):
                     db_cursor.execute(
                         "INSERT INTO prices (item_id, price) VALUES (?, ?)",
@@ -56,31 +56,32 @@ async def get_laptops(limit: int = 10, page: int = 1):
                     )
                     connection.commit()
                     await session.close()
-                    return f"https://www.technodom.kz/p/{uri} {price} {item_last_price_row}"
-    return ""
+                    results.append(f"{title} - https://www.technodom.kz/p/{uri} - старая цена {price} - новая цена {item_last_price_row}")
+    return "\n".join(results)
 
 
 async def main():
     async with aiohttp.ClientSession() as session:
-        response = await session.get(BASE_URL.substitute(limit=10, page=1))
-        response_json = await response.json()
-        limit = response_json["limit"]
-        total = response_json["total"]
-        number_of_pages = math.ceil(total / limit)
-        tasks = []
-        for page in range(1, number_of_pages + 1):
-            task = asyncio.create_task(get_laptops(limit=limit, page=page))
-            tasks.append(task)
-        results = await asyncio.gather(*tasks)
-        results = [item for item in results if item]
-        max_items = 3
-        if results:
-            for i in range(0, len(results), max_items):
+        categories = ["vstraivaemye-poverhnosti", "stiral-nye-mashiny", "vstraivaemye-duhovki"]
+        for category in categories: 
+            response = await session.get(BASE_URL.substitute(category=category, limit=5, page=1))
+            response_json = await response.json()
+            limit = response_json["limit"]
+            total = response_json["total"]
+            number_of_pages = math.ceil(total / limit)
+            tasks = []
+            for page in range(1, number_of_pages + 1):
+                task = asyncio.create_task(get_by_type(category=category, limit=limit, page=page)) # coroutine
+                tasks.append(task) # list[coroutine]
+            results = await asyncio.gather(*tasks) # list[str]
+            for result in results: # str in list[str]
+                if not result: continue # coroutine == "" 
                 try:
-                    await send_message("\n".join(results[i : i + max_items]))
-                except:
-                    pass
+                    await send_message(result) # send
+                except Exception as e:
+                    print(e)
                 time.sleep(10)
+        
 
 
 loop = asyncio.get_event_loop()
